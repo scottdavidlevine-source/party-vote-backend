@@ -167,13 +167,13 @@ app.post("/vote", async (req, res) => {
   }
 });
 
-// ---------------- Current Song Endpoint ----------------
 app.get("/current", async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("current_song")
       .select("*")
       .eq("party_id", PARTY_ID)
+      .order("updated_at", { ascending: false })
       .limit(1);
 
     if (error) {
