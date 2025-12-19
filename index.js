@@ -167,4 +167,30 @@ app.post("/vote", async (req, res) => {
   }
 });
 
+// ---------------- Current Song Endpoint ----------------
+app.get("/current", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("current_song")
+      .select("*")
+      .eq("party_id", PARTY_ID)
+      .limit(1);
+
+    if (error) {
+      console.error("Supabase fetch error:", error);
+      return res.status(500).json({});
+    }
+
+    if (!data || data.length === 0) {
+      return res.json({});
+    }
+
+    res.json(data[0]);
+  } catch (err) {
+    console.error("Current endpoint error:", err);
+    res.status(500).json({});
+  }
+});
+
+
 app.listen(PORT, () => console.log(`Party-vote backend running on port ${PORT}`));
