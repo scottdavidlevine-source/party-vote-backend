@@ -1,4 +1,4 @@
-const BASE_URL = "https://YOUR-BACKEND.onrender.com"; // 🔧 CHANGE THIS
+const BASE_URL = "https://party-vote-backend.onrender.com"; // 🔧 CHANGE THIS
 const DOWNVOTE_THRESHOLD = 5;
 
 const songEl = document.getElementById("song");
