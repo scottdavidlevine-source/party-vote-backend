@@ -67,7 +67,9 @@ async function refreshSpotifyToken() {
 // Refresh every 50 minutes
 setInterval(refreshSpotifyToken, 50 * 60 * 1000);
 
-// ---------------- Poll Spotify ----------------
+// ---------------- Poll Spotify + Track Song Lifecycle ----------------
+let lastTrackId = null;
+
 setInterval(async () => {
   try {
     const res = await spotifyRequest(
@@ -78,19 +80,52 @@ setInterval(async () => {
     if (!res.data?.item) return;
 
     const track = res.data.item;
+    const currentTrackId = track.id;
 
-    const payload = {
-      party_id: PARTY_ID,
-      spotify_track_id: track.id,
-      track_name: track.name,
-      artist: track.artists[0].name,
-      upvotes: 0,
-      downvotes: 0,
-    };
+    // 🔁 Detect natural song end
+    if (lastTrackId && lastTrackId !== currentTrackId) {
+      const { data: previousSong } = await supabase
+        .from("current_song")
+        .select("*")
+        .eq("party_id", PARTY_ID)
+        .single();
 
+      if (previousSong) {
+        await supabase.from("song_history").insert({
+          party_id: PARTY_ID,
+          spotify_track_id: previousSong.spotify_track_id,
+          track_name: previousSong.track_name,
+          artist: previousSong.artist,
+          downvotes: previousSong.downvotes,
+          skipped: false,
+          ended_at: new Date(),
+        });
+
+        // Clear votes for previous song
+        await supabase
+          .from("votes")
+          .delete()
+          .eq("party_id", PARTY_ID)
+          .eq("spotify_track_id", previousSong.spotify_track_id);
+      }
+    }
+
+    lastTrackId = currentTrackId;
+
+    // 🎶 Upsert current song
     await supabase
       .from("current_song")
-      .upsert(payload, { onConflict: "party_id" });
+      .upsert(
+        {
+          party_id: PARTY_ID,
+          spotify_track_id: track.id,
+          track_name: track.name,
+          artist: track.artists[0].name,
+          upvotes: 0,
+          downvotes: 0,
+        },
+        { onConflict: "party_id" }
+      );
 
   } catch (err) {
     console.error("Polling error:", err.response?.data || err.message);
@@ -108,7 +143,7 @@ app.get("/current", async (req, res) => {
   res.json(data || {});
 });
 
-// ---------------- Vote ----------------
+// ---------------- Vote Endpoint ----------------
 app.post("/vote", async (req, res) => {
   const { device_id, vote } = req.body;
 
@@ -123,7 +158,9 @@ app.post("/vote", async (req, res) => {
       .eq("party_id", PARTY_ID)
       .single();
 
-    if (!song) return res.status(404).json({ error: "No song playing" });
+    if (!song) {
+      return res.status(404).json({ error: "No song playing" });
+    }
 
     // ⛔ Prevent double voting
     const { error: voteError } = await supabase.from("votes").insert({
@@ -159,7 +196,7 @@ app.post("/vote", async (req, res) => {
         "https://api.spotify.com/v1/me/player/next"
       );
 
-      // 🧾 Song history
+      // 🧾 Write song history
       await supabase.from("song_history").insert({
         party_id: PARTY_ID,
         spotify_track_id: song.spotify_track_id,
@@ -167,14 +204,16 @@ app.post("/vote", async (req, res) => {
         artist: song.artist,
         downvotes,
         skipped: true,
+        ended_at: new Date(),
       });
 
-      // Reset for next song
+      // Reset current song
       await supabase
         .from("current_song")
         .update({ upvotes: 0, downvotes: 0 })
         .eq("party_id", PARTY_ID);
 
+      // Clear votes
       await supabase
         .from("votes")
         .delete()
@@ -216,7 +255,7 @@ app.get("/analytics", async (req, res) => {
   });
 });
 
-// ---------------- Start ----------------
+// ---------------- Start Server ----------------
 async function start() {
   await refreshSpotifyToken();
   app.listen(PORT, () =>
