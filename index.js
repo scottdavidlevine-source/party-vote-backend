@@ -69,50 +69,58 @@ setInterval(async () => {
 
     const track = res.data.item;
 
-    // Detect song change (natural end)
-    if (lastTrackId && lastTrackId !== track.id) {
-      const { data: prev } = await supabase
-        .from("current_song")
-        .select("*")
-        .eq("party_id", PARTY_ID)
-        .single();
+    // 🎶 SONG CHANGED
+    if (lastTrackId !== track.id) {
+      console.log("New song detected:", track.name);
 
-      if (prev) {
-        await supabase.from("song_history").insert({
-          party_id: PARTY_ID,
-          spotify_track_id: prev.spotify_track_id,
-          track_name: prev.track_name,
-          artist: prev.artist,
-          downvotes: prev.downvotes,
-          skipped: false,
-        });
-
-        await supabase
-          .from("votes")
-          .delete()
+      // Write previous song to history (if exists)
+      if (lastTrackId) {
+        const { data: prev } = await supabase
+          .from("current_song")
+          .select("*")
           .eq("party_id", PARTY_ID)
-          .eq("spotify_track_id", prev.spotify_track_id);
+          .single();
+
+        if (prev) {
+          await supabase.from("song_history").insert({
+            party_id: PARTY_ID,
+            spotify_track_id: prev.spotify_track_id,
+            track_name: prev.track_name,
+            artist: prev.artist,
+            downvotes: prev.downvotes,
+            skipped: false,
+          });
+
+          await supabase
+            .from("votes")
+            .delete()
+            .eq("party_id", PARTY_ID)
+            .eq("spotify_track_id", prev.spotify_track_id);
+        }
       }
+
+      // 🔁 NEW SONG → reset votes ONCE
+      await supabase.from("current_song").upsert(
+        {
+          party_id: PARTY_ID,
+          spotify_track_id: track.id,
+          track_name: track.name,
+          artist: track.artists[0].name,
+          upvotes: 0,
+          downvotes: 0,
+        },
+        { onConflict: "party_id" }
+      );
+
+      lastTrackId = track.id;
     }
 
-    lastTrackId = track.id;
-
-    // Upsert current song
-    await supabase.from("current_song").upsert(
-      {
-        party_id: PARTY_ID,
-        spotify_track_id: track.id,
-        track_name: track.name,
-        artist: track.artists[0].name,
-        upvotes: 0,
-        downvotes: 0,
-      },
-      { onConflict: "party_id" }
-    );
+    // ❗ ELSE: same song → DO NOTHING (do NOT reset votes)
   } catch (err) {
     console.error("Polling error:", err.message);
   }
 }, 5000);
+
 
 // ---------- Routes ----------
 app.get("/current", async (_, res) => {
