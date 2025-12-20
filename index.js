@@ -27,7 +27,7 @@ let spotifyTokens = {
   refresh_token: process.env.SPOTIFY_REFRESH_TOKEN,
 };
 
-// ---------------- Spotify API Helper ----------------
+// ---------------- Spotify Helper ----------------
 async function spotifyRequest(method, url, config = {}) {
   return axios({
     method,
@@ -49,26 +49,19 @@ async function refreshSpotifyToken() {
     `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`
   ).toString("base64");
 
-  try {
-    const res = await axios.post(
-      "https://accounts.spotify.com/api/token",
-      params,
-      {
-        headers: {
-          Authorization: `Basic ${auth}`,
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-      }
-    );
+  const res = await axios.post(
+    "https://accounts.spotify.com/api/token",
+    params,
+    {
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+    }
+  );
 
-    spotifyTokens.access_token = res.data.access_token;
-    console.log("Spotify token refreshed");
-  } catch (err) {
-    console.error(
-      "Error refreshing Spotify token:",
-      err.response?.data || err.message
-    );
-  }
+  spotifyTokens.access_token = res.data.access_token;
+  console.log("Spotify token refreshed");
 }
 
 // Refresh every 50 minutes
@@ -77,59 +70,14 @@ setInterval(refreshSpotifyToken, 50 * 60 * 1000);
 // ---------------- Poll Spotify ----------------
 setInterval(async () => {
   try {
-    console.log("Polling Spotify…");
-
     const res = await spotifyRequest(
       "get",
       "https://api.spotify.com/v1/me/player/currently-playing"
     );
 
-    if (!res.data || !res.data.item) return;
+    if (!res.data?.item) return;
 
     const track = res.data.item;
-    console.log("Currently playing:", track.name, "-", track.artists[0].name);
-
-    const playlistId = process.env.SPOTIFY_PLAYLIST_ID;
-    let addedBy = "Auto / Queue";
-
-    // Attempt to resolve added_by only if from playlist
-    if (
-      playlistId &&
-      res.data.context?.type === "playlist" &&
-      res.data.context?.uri?.includes(playlistId)
-    ) {
-      let offset = 0;
-      const limit = 100;
-      let total = 1;
-      let allTracks = [];
-
-      while (allTracks.length < total) {
-        const playlistRes = await spotifyRequest(
-          "get",
-          `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
-          {
-            params: {
-              limit,
-              offset,
-              fields: "items(track(id),added_by.display_name),total",
-            },
-          }
-        );
-
-        const items = playlistRes.data.items || [];
-        allTracks.push(...items);
-        total = playlistRes.data.total;
-        offset += limit;
-      }
-
-      const match = allTracks.find(
-        (i) => i.track?.id === track.id
-      );
-
-      if (match?.added_by?.display_name) {
-        addedBy = match.added_by.display_name;
-      }
-    }
 
     const payload = {
       party_id: PARTY_ID,
@@ -138,49 +86,29 @@ setInterval(async () => {
       artist: track.artists[0].name,
       upvotes: 0,
       downvotes: 0,
-      added_by: addedBy,
     };
 
-    const { data, error } = await supabase
+    await supabase
       .from("current_song")
-      .upsert(payload, { onConflict: "party_id" })
-      .select();
+      .upsert(payload, { onConflict: "party_id" });
 
-    if (error) {
-      console.error("Supabase upsert error:", error);
-    } else {
-      console.log("Upserted row:", data);
-    }
   } catch (err) {
-    console.error(
-      "Polling error:",
-      err.response?.data || err.message
-    );
+    console.error("Polling error:", err.response?.data || err.message);
   }
 }, 5000);
 
-// ---------------- Current Song Endpoint ----------------
+// ---------------- Current Song ----------------
 app.get("/current", async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("current_song")
-      .select("*")
-      .eq("party_id", PARTY_ID)
-      .order("updated_at", { ascending: false })
-      .limit(1);
+  const { data } = await supabase
+    .from("current_song")
+    .select("*")
+    .eq("party_id", PARTY_ID)
+    .single();
 
-    if (error || !data || data.length === 0) {
-      return res.json({});
-    }
-
-    res.json(data[0]);
-  } catch (err) {
-    console.error("Current endpoint error:", err);
-    res.status(500).json({});
-  }
+  res.json(data || {});
 });
 
-// ---------------- Voting Endpoint ----------------
+// ---------------- Vote ----------------
 app.post("/vote", async (req, res) => {
   const { device_id, vote } = req.body;
 
@@ -189,17 +117,25 @@ app.post("/vote", async (req, res) => {
   }
 
   try {
-    const { data } = await supabase
+    const { data: song } = await supabase
       .from("current_song")
       .select("*")
       .eq("party_id", PARTY_ID)
-      .limit(1);
+      .single();
 
-    if (!data || data.length === 0) {
-      return res.status(404).json({ error: "No current song" });
+    if (!song) return res.status(404).json({ error: "No song playing" });
+
+    // ⛔ Prevent double voting
+    const { error: voteError } = await supabase.from("votes").insert({
+      party_id: PARTY_ID,
+      spotify_track_id: song.spotify_track_id,
+      device_id,
+      vote,
+    });
+
+    if (voteError) {
+      return res.status(409).json({ error: "Already voted" });
     }
-
-    const song = data[0];
 
     let upvotes = song.upvotes;
     let downvotes = song.downvotes;
@@ -212,38 +148,80 @@ app.post("/vote", async (req, res) => {
       .update({ upvotes, downvotes })
       .eq("party_id", PARTY_ID);
 
+    let skipped = false;
+
+    // ⏭ Skip logic
     if (downvotes >= DOWNVOTE_THRESHOLD) {
-      console.log("Downvote threshold hit — skipping song");
+      skipped = true;
 
-      try {
-        await spotifyRequest(
-          "post",
-          "https://api.spotify.com/v1/me/player/next"
-        );
-      } catch (err) {
-        console.error("Spotify skip error:", err.response?.data || err.message);
-      }
+      await spotifyRequest(
+        "post",
+        "https://api.spotify.com/v1/me/player/next"
+      );
 
+      // 🧾 Song history
+      await supabase.from("song_history").insert({
+        party_id: PARTY_ID,
+        spotify_track_id: song.spotify_track_id,
+        track_name: song.track_name,
+        artist: song.artist,
+        downvotes,
+        skipped: true,
+      });
+
+      // Reset for next song
       await supabase
         .from("current_song")
         .update({ upvotes: 0, downvotes: 0 })
         .eq("party_id", PARTY_ID);
+
+      await supabase
+        .from("votes")
+        .delete()
+        .eq("party_id", PARTY_ID)
+        .eq("spotify_track_id", song.spotify_track_id);
     }
 
-    res.json({ success: true, upvotes, downvotes });
+    res.json({
+      success: true,
+      upvotes,
+      downvotes,
+      remaining_to_skip: Math.max(DOWNVOTE_THRESHOLD - downvotes, 0),
+      skipped,
+    });
   } catch (err) {
     console.error("Vote error:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
 
-// ---------------- Start Server ----------------
+// ---------------- Party Analytics ----------------
+app.get("/analytics", async (req, res) => {
+  const { data: history } = await supabase
+    .from("song_history")
+    .select("*")
+    .eq("party_id", PARTY_ID)
+    .order("ended_at", { ascending: false });
+
+  const totalSongs = history.length;
+  const skippedSongs = history.filter(h => h.skipped).length;
+
+  res.json({
+    total_songs: totalSongs,
+    skipped_songs: skippedSongs,
+    skip_rate: totalSongs
+      ? Math.round((skippedSongs / totalSongs) * 100)
+      : 0,
+    history,
+  });
+});
+
+// ---------------- Start ----------------
 async function start() {
   await refreshSpotifyToken();
-
-  app.listen(PORT, () => {
-    console.log(`Party-vote backend running on port ${PORT}`);
-  });
+  app.listen(PORT, () =>
+    console.log(`Party-vote backend running on port ${PORT}`)
+  );
 }
 
 start();
